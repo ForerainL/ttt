@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import pandas as pd
+from sortedcontainers import SortedDict
 
 
 @dataclass
@@ -21,8 +22,8 @@ class OrderBookRector:
     def __init__(self, verbose: bool = False) -> None:
         self.verbose = verbose
         self._orders: Dict[int, _OrderState] = {}
-        self._bids: Dict[float, float] = {}
-        self._asks: Dict[float, float] = {}
+        self._bids: SortedDict[float, float] = SortedDict()
+        self._asks: SortedDict[float, float] = SortedDict()
         self._cum_trade_qty = 0.0
         self._cum_trade_amt = 0.0
         self._last_price = None
@@ -35,7 +36,7 @@ class OrderBookRector:
         if self.verbose:
             print(message)
 
-    def _update_level(self, book: Dict[float, float], price: float, delta_qty: float) -> None:
+    def _update_level(self, book: SortedDict[float, float], price: float, delta_qty: float) -> None:
         new_qty = book.get(price, 0.0) + delta_qty
         if new_qty <= 0:
             book.pop(price, None)
@@ -43,6 +44,10 @@ class OrderBookRector:
             book[price] = new_qty
 
     def _apply_insert(self, row: pd.Series) -> None:
+        order_flag = str(row.get("msg_order_flag", ""))
+        if order_flag != "2":
+            self._log(f"Ignored non-limit order insert flag={order_flag}")
+            return
         order_id = int(row["order_id"])
         side = int(row["order_side"])
         price = float(row["order_opx"])
@@ -74,29 +79,19 @@ class OrderBookRector:
         self._cum_trade_amt += trade_qty * trade_price
         self._last_price = trade_price
 
-        for key in ("bid_order_id", "ask_order_id"):
-            order_id = row.get(key)
-            if pd.isna(order_id):
-                continue
-            try:
-                order_id_int = int(order_id)
-            except ValueError:
-                continue
-            order_state = self._orders.get(order_id_int)
-            if not order_state:
-                self._log(f"Trade references unknown order {order_id_int}")
-                continue
-            trade_qty_to_apply = min(trade_qty, order_state.qty)
-            order_state.qty -= trade_qty_to_apply
-            book = self._bids if order_state.side == 1 else self._asks
-            self._update_level(book, order_state.price, -trade_qty_to_apply)
-            if order_state.qty <= 0:
-                self._orders.pop(order_id_int, None)
+        self._update_level(self._bids, trade_price, -trade_qty)
+        self._update_level(self._asks, trade_price, -trade_qty)
         self._log(f"Trade qty={trade_qty} price={trade_price}")
 
-    def _top_levels(self, book: Dict[float, float], depth: int, reverse: bool) -> List[Tuple[float, float]]:
-        sorted_levels = sorted(book.items(), key=lambda item: item[0], reverse=reverse)
-        return sorted_levels[:depth]
+    def _top_levels(self, book: SortedDict[float, float], depth: int, reverse: bool) -> List[Tuple[float, float]]:
+        if not reverse:
+            return list(book.items()[:depth])
+        levels: List[Tuple[float, float]] = []
+        for price in reversed(book.keys()):
+            levels.append((price, book[price]))
+            if len(levels) >= depth:
+                break
+        return levels
 
     def _build_snapshot(self, row: pd.Series) -> Dict[str, object]:
         snapshot: Dict[str, object] = {
