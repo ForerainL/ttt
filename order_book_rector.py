@@ -30,7 +30,7 @@ class OrderBookRector:
 
     @staticmethod
     def author() -> str:
-        return "OpenAI Assistant"
+        return "orderbook_rector"
 
     def _log(self, message: str) -> None:
         if self.verbose:
