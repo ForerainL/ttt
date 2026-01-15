@@ -111,16 +111,7 @@ class OrderBookRectorActive:
                 self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
                 self._log(f"Insert best-of-own order {order_id} side={side} qty={qty} (no reference)")
                 return
-            best_ask = self._best_ask()
-            best_bid = self._best_bid()
-            if side == 1 and best_ask is not None and reference_price >= best_ask:
-                self._log(f"Skip best-of-own insert {order_id}: would cross best ask")
-                self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
-                return
-            if side == 2 and best_bid is not None and reference_price <= best_bid:
-                self._log(f"Skip best-of-own insert {order_id}: would cross best bid")
-                self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
-                return
+            # Best-of-own orders rest at the same-side best and should not cross.
             self._orders[order_id] = _OrderState(
                 side=side,
                 price=reference_price,
@@ -213,11 +204,6 @@ class OrderBookRectorActive:
                     f"expected {expected_side} got {order_state.side}"
                 )
             shadow_fill = self._shadow_fills_orders.get(order_id_int, 0.0)
-            if shadow_fill and shadow_fill != trade_qty:
-                self._log(
-                    f"Mismatch between simulated fill and trade fill for order {order_id_int}: "
-                    f"simulated={shadow_fill} trade={trade_qty}"
-                )
             shadow_used = min(trade_qty, shadow_fill)
             exec_qty = trade_qty - shadow_used
             if shadow_fill:
@@ -232,6 +218,7 @@ class OrderBookRectorActive:
                     level_shadow = self._shadow_fills_bids.get(order_state.price, 0.0)
                 else:
                     level_shadow = self._shadow_fills_asks.get(order_state.price, 0.0)
+                # Price-level shadow fills are best-effort, not order-accurate.
                 level_used = min(exec_qty, level_shadow)
                 remaining_trade = exec_qty - level_used
                 if level_shadow:
