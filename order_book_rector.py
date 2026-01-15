@@ -10,6 +10,9 @@ import numpy as np
 import pandas as pd
 from sortedcontainers import SortedDict
 
+_TIME_WINDOW_START = 92500 * 1_000_000_000
+_TIME_WINDOW_END = 145700 * 1_000_000_000
+
 
 @dataclass
 class _OrderState:
@@ -163,6 +166,19 @@ class OrderBookRector:
             snapshot[f"bid_{idx}_qty"] = bid_qty
         return snapshot
 
+    @staticmethod
+    def _within_time_window(row: pd.Series) -> bool:
+        if "hhmmss_nano" not in row:
+            return True
+        value = row.get("hhmmss_nano")
+        if pd.isna(value):
+            return False
+        try:
+            value_int = int(value)
+        except (TypeError, ValueError):
+            return False
+        return _TIME_WINDOW_START <= value_int <= _TIME_WINDOW_END
+
     def apply_construction(self, md_order: pd.DataFrame, md_trade: pd.DataFrame) -> pd.DataFrame:
         order_events = md_order.copy()
         order_events["_event_type"] = "order"
@@ -186,7 +202,8 @@ class OrderBookRector:
                     self._log(f"Unknown order type {msg_type}")
             else:
                 self._apply_trade(row)
-            snapshots.append(self._build_snapshot(row))
+            if self._within_time_window(row):
+                snapshots.append(self._build_snapshot(row))
 
         return pd.DataFrame(snapshots)
 

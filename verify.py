@@ -204,3 +204,54 @@ def verify_official_is_subset(
         "mismatch_rows": mismatch_rows,
         "summary": summary,
     }
+
+
+def align_and_compare_snapshots(
+    recon_snapshot: pd.DataFrame,
+    official_snapshot: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """Align recon/official snapshots on timestamp keys and compare book levels."""
+    key_cols = ["skey", "yyyymmdd", "hhmmss_nano"]
+    missing_keys = [col for col in key_cols if col not in recon_snapshot.columns or col not in official_snapshot.columns]
+    if missing_keys:
+        return pd.DataFrame(), {
+            "total_matched": 0,
+            "missing_keys": missing_keys,
+            "mismatches": {},
+        }
+
+    level_cols = []
+    for idx in range(1, 11):
+        level_cols.extend(
+            [
+                f"bid_{idx}_opx",
+                f"bid_{idx}_qty",
+                f"ask_{idx}_opx",
+                f"ask_{idx}_qty",
+            ]
+        )
+
+    recon_cols = [col for col in level_cols if col in recon_snapshot.columns]
+    official_cols = [col for col in level_cols if col in official_snapshot.columns]
+    common_cols = [col for col in level_cols if col in recon_cols and col in official_cols]
+
+    recon_prefixed = recon_snapshot[key_cols + recon_cols].rename(
+        columns={col: f"recon_{col}" for col in recon_cols}
+    )
+    official_prefixed = official_snapshot[key_cols + official_cols].rename(
+        columns={col: f"official_{col}" for col in official_cols}
+    )
+
+    merged = pd.merge(recon_prefixed, official_prefixed, on=key_cols, how="inner", sort=False)
+    mismatches: dict[str, int] = {}
+    for col in common_cols:
+        recon_col = merged[f"recon_{col}"]
+        official_col = merged[f"official_{col}"]
+        equal_mask = recon_col.eq(official_col) | (recon_col.isna() & official_col.isna())
+        mismatches[col] = int((~equal_mask).sum())
+
+    report = {
+        "total_matched": len(merged),
+        "mismatches": mismatches,
+    }
+    return merged, report

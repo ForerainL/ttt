@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 from sortedcontainers import SortedDict
 
+_TIME_WINDOW_START = 92500 * 1_000_000_000
+_TIME_WINDOW_END = 145700 * 1_000_000_000
+
 
 @dataclass
 class _OrderState:
@@ -25,7 +28,6 @@ class OrderBookRectorActive:
         self,
         verbose: bool = False,
         limit_state_detector: Optional[Callable[[pd.Series], Optional[str]]] = None,
-        allow_active_nonlimit: bool = False,
     ) -> None:
         self.verbose = verbose
         self._orders: Dict[int, _OrderState] = {}
@@ -35,10 +37,10 @@ class OrderBookRectorActive:
         self._cum_trade_amt = 0.0
         self._last_price = None
         self._limit_state_detector = limit_state_detector
-        # Best-of-own / best orders are treated as non-resting by default.
-        # If allow_active_nonlimit is True, they can consume opposite book
-        # but any remainder is cancelled.
-        self._allow_active_nonlimit = allow_active_nonlimit
+        # Best-of-own orders are inserted at the current same-side best price.
+        self._shadow_fills_orders: Dict[int, float] = {}
+        self._shadow_fills_bids: Dict[float, float] = {}
+        self._shadow_fills_asks: Dict[float, float] = {}
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -61,7 +63,7 @@ class OrderBookRectorActive:
             return None
         return next(iter(self._asks.keys()))
 
-    def _consume_opposite(self, side: int, qty: float) -> float:
+    def _consume_opposite(self, side: int, qty: float, limit_price: Optional[float] = None) -> float:
         if qty <= 0:
             return 0.0
         remaining = qty
@@ -71,20 +73,22 @@ class OrderBookRectorActive:
             for price in prices:
                 if remaining <= 0:
                     break
+                if limit_price is not None and price > limit_price:
+                    break
                 level_qty = self._asks.get(price, 0.0)
                 if level_qty <= 0:
                     continue
                 take_qty = min(remaining, level_qty)
                 remaining -= take_qty
                 self._update_level(self._asks, price, -take_qty)
-                self._cum_trade_qty += take_qty
-                self._cum_trade_amt += take_qty * price
-                self._last_price = price
+                self._shadow_fills_asks[price] = self._shadow_fills_asks.get(price, 0.0) + take_qty
         else:
             # Sell: consume bids from high to low.
             prices = list(reversed(self._bids.keys()))
             for price in prices:
                 if remaining <= 0:
+                    break
+                if limit_price is not None and price < limit_price:
                     break
                 level_qty = self._bids.get(price, 0.0)
                 if level_qty <= 0:
@@ -92,9 +96,7 @@ class OrderBookRectorActive:
                 take_qty = min(remaining, level_qty)
                 remaining -= take_qty
                 self._update_level(self._bids, price, -take_qty)
-                self._cum_trade_qty += take_qty
-                self._cum_trade_amt += take_qty * price
-                self._last_price = price
+                self._shadow_fills_bids[price] = self._shadow_fills_bids.get(price, 0.0) + take_qty
         return remaining
 
     def _apply_insert(self, row: pd.Series) -> None:
@@ -103,15 +105,32 @@ class OrderBookRectorActive:
         qty = float(row["order_qty"])
         order_flag = str(row.get("msg_order_flag", ""))
 
+        if order_flag == "3":
+            reference_price = self._best_bid() if side == 1 else self._best_ask()
+            if reference_price is None:
+                self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
+                self._log(f"Insert best-of-own order {order_id} side={side} qty={qty} (no reference)")
+                return
+            # Best-of-own orders rest at the same-side best and should not cross.
+            self._orders[order_id] = _OrderState(
+                side=side,
+                price=reference_price,
+                qty=qty,
+                is_limit=True,
+            )
+            book = self._bids if side == 1 else self._asks
+            self._update_level(book, reference_price, qty)
+            self._log(f"Insert best-of-own order {order_id} side={side} price={reference_price} qty={qty}")
+            return
+
         if order_flag != "2":
             self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
-            if self._allow_active_nonlimit:
-                remaining = self._consume_opposite(side, qty)
-                if remaining <= 0:
-                    self._orders.pop(order_id, None)
-                else:
-                    self._orders[order_id].qty = remaining
-            self._log(f"Insert non-limit order {order_id} side={side} qty={qty}")
+            remaining = self._consume_opposite(side, qty)
+            filled_qty = qty - remaining
+            if filled_qty > 0:
+                self._shadow_fills_orders[order_id] = self._shadow_fills_orders.get(order_id, 0.0) + filled_qty
+            self._orders.pop(order_id, None)
+            self._log(f"Insert market order {order_id} side={side} qty={qty}")
             return
 
         price = float(row["order_opx"])
@@ -119,11 +138,21 @@ class OrderBookRectorActive:
 
         best_ask = self._best_ask()
         best_bid = self._best_bid()
-        marketable = (side == 1 and best_ask is not None and price >= best_ask) or (
-            side == 2 and best_bid is not None and price <= best_bid
-        )
-        if marketable:
-            remaining = self._consume_opposite(side, qty)
+        if side == 1 and best_ask is not None and price >= best_ask:
+            remaining = self._consume_opposite(side, qty, limit_price=price)
+            filled_qty = qty - remaining
+            if filled_qty > 0:
+                self._shadow_fills_orders[order_id] = self._shadow_fills_orders.get(order_id, 0.0) + filled_qty
+            if remaining <= 0:
+                self._orders.pop(order_id, None)
+                return
+            self._orders[order_id].qty = remaining
+            qty = remaining
+        elif side == 2 and best_bid is not None and price <= best_bid:
+            remaining = self._consume_opposite(side, qty, limit_price=price)
+            filled_qty = qty - remaining
+            if filled_qty > 0:
+                self._shadow_fills_orders[order_id] = self._shadow_fills_orders.get(order_id, 0.0) + filled_qty
             if remaining <= 0:
                 self._orders.pop(order_id, None)
                 return
@@ -174,11 +203,39 @@ class OrderBookRectorActive:
                     f"Trade side mismatch for order {order_id_int}: "
                     f"expected {expected_side} got {order_state.side}"
                 )
-            fill_qty = min(trade_qty, order_state.qty)
-            order_state.qty -= fill_qty
-            if order_state.is_limit and order_state.price is not None:
-                book = self._bids if order_state.side == 1 else self._asks
-                self._update_level(book, order_state.price, -fill_qty)
+            shadow_fill = self._shadow_fills_orders.get(order_id_int, 0.0)
+            shadow_used = min(trade_qty, shadow_fill)
+            exec_qty = trade_qty - shadow_used
+            if shadow_fill:
+                new_shadow = shadow_fill - shadow_used
+                if new_shadow > 0:
+                    self._shadow_fills_orders[order_id_int] = new_shadow
+                else:
+                    self._shadow_fills_orders.pop(order_id_int, None)
+            order_state.qty -= exec_qty
+            if order_state.is_limit and order_state.price is not None and exec_qty > 0:
+                if order_state.side == 1:
+                    level_shadow = self._shadow_fills_bids.get(order_state.price, 0.0)
+                else:
+                    level_shadow = self._shadow_fills_asks.get(order_state.price, 0.0)
+                # Price-level shadow fills are best-effort, not order-accurate.
+                level_used = min(exec_qty, level_shadow)
+                remaining_trade = exec_qty - level_used
+                if level_shadow:
+                    new_level_shadow = level_shadow - level_used
+                    if order_state.side == 1:
+                        if new_level_shadow > 0:
+                            self._shadow_fills_bids[order_state.price] = new_level_shadow
+                        else:
+                            self._shadow_fills_bids.pop(order_state.price, None)
+                    else:
+                        if new_level_shadow > 0:
+                            self._shadow_fills_asks[order_state.price] = new_level_shadow
+                        else:
+                            self._shadow_fills_asks.pop(order_state.price, None)
+                if remaining_trade > 0:
+                    book = self._bids if order_state.side == 1 else self._asks
+                    self._update_level(book, order_state.price, -remaining_trade)
             if order_state.qty <= 0:
                 self._orders.pop(order_id_int, None)
         self._log(f"Trade qty={trade_qty} price={trade_price}")
@@ -226,6 +283,19 @@ class OrderBookRectorActive:
             snapshot[f"bid_{idx}_qty"] = bid_qty
         return snapshot
 
+    @staticmethod
+    def _within_time_window(row: pd.Series) -> bool:
+        if "hhmmss_nano" not in row:
+            return True
+        value = row.get("hhmmss_nano")
+        if pd.isna(value):
+            return False
+        try:
+            value_int = int(value)
+        except (TypeError, ValueError):
+            return False
+        return _TIME_WINDOW_START <= value_int <= _TIME_WINDOW_END
+
     def apply_construction(self, md_order: pd.DataFrame, md_trade: pd.DataFrame) -> pd.DataFrame:
         order_events = md_order.copy()
         order_events["_event_type"] = "order"
@@ -249,6 +319,29 @@ class OrderBookRectorActive:
                     self._log(f"Unknown order type {msg_type}")
             else:
                 self._apply_trade(row)
-            snapshots.append(self._build_snapshot(row))
+            if self._within_time_window(row):
+                snapshots.append(self._build_snapshot(row))
 
         return pd.DataFrame(snapshots)
+
+
+def reconstruct_many_symbols_active(
+    md_order: pd.DataFrame,
+    md_trade: pd.DataFrame,
+    *,
+    verbose: bool = False,
+    limit_state_detector: Optional[Callable[[pd.Series], Optional[str]]] = None,
+) -> pd.DataFrame:
+    results = []
+    for skey, g_order in md_order.groupby("skey", sort=False):
+        g_trade = md_trade[md_trade["skey"] == skey]
+        rector = OrderBookRectorActive(
+            verbose=verbose,
+            limit_state_detector=limit_state_detector,
+        )
+        df = rector.apply_construction(g_order, g_trade)
+        results.append(df)
+
+    if not results:
+        return pd.DataFrame()
+    return pd.concat(results, ignore_index=True)
