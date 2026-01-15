@@ -38,6 +38,9 @@ class OrderBookRectorActive:
         self._last_price = None
         self._limit_state_detector = limit_state_detector
         # Best-of-own orders are inserted at the current same-side best price.
+        self._shadow_fills_orders: Dict[int, float] = {}
+        self._shadow_fills_bids: Dict[float, float] = {}
+        self._shadow_fills_asks: Dict[float, float] = {}
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -78,9 +81,7 @@ class OrderBookRectorActive:
                 take_qty = min(remaining, level_qty)
                 remaining -= take_qty
                 self._update_level(self._asks, price, -take_qty)
-                self._cum_trade_qty += take_qty
-                self._cum_trade_amt += take_qty * price
-                self._last_price = price
+                self._shadow_fills_asks[price] = self._shadow_fills_asks.get(price, 0.0) + take_qty
         else:
             # Sell: consume bids from high to low.
             prices = list(reversed(self._bids.keys()))
@@ -95,9 +96,7 @@ class OrderBookRectorActive:
                 take_qty = min(remaining, level_qty)
                 remaining -= take_qty
                 self._update_level(self._bids, price, -take_qty)
-                self._cum_trade_qty += take_qty
-                self._cum_trade_amt += take_qty * price
-                self._last_price = price
+                self._shadow_fills_bids[price] = self._shadow_fills_bids.get(price, 0.0) + take_qty
         return remaining
 
     def _apply_insert(self, row: pd.Series) -> None:
@@ -136,6 +135,9 @@ class OrderBookRectorActive:
         if order_flag != "2":
             self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
             remaining = self._consume_opposite(side, qty)
+            filled_qty = qty - remaining
+            if filled_qty > 0:
+                self._shadow_fills_orders[order_id] = self._shadow_fills_orders.get(order_id, 0.0) + filled_qty
             self._orders.pop(order_id, None)
             self._log(f"Insert market order {order_id} side={side} qty={qty}")
             return
@@ -147,6 +149,9 @@ class OrderBookRectorActive:
         best_bid = self._best_bid()
         if side == 1 and best_ask is not None and price >= best_ask:
             remaining = self._consume_opposite(side, qty, limit_price=price)
+            filled_qty = qty - remaining
+            if filled_qty > 0:
+                self._shadow_fills_orders[order_id] = self._shadow_fills_orders.get(order_id, 0.0) + filled_qty
             if remaining <= 0:
                 self._orders.pop(order_id, None)
                 return
@@ -154,6 +159,9 @@ class OrderBookRectorActive:
             qty = remaining
         elif side == 2 and best_bid is not None and price <= best_bid:
             remaining = self._consume_opposite(side, qty, limit_price=price)
+            filled_qty = qty - remaining
+            if filled_qty > 0:
+                self._shadow_fills_orders[order_id] = self._shadow_fills_orders.get(order_id, 0.0) + filled_qty
             if remaining <= 0:
                 self._orders.pop(order_id, None)
                 return
@@ -204,11 +212,43 @@ class OrderBookRectorActive:
                     f"Trade side mismatch for order {order_id_int}: "
                     f"expected {expected_side} got {order_state.side}"
                 )
-            fill_qty = min(trade_qty, order_state.qty)
-            order_state.qty -= fill_qty
-            if order_state.is_limit and order_state.price is not None:
-                book = self._bids if order_state.side == 1 else self._asks
-                self._update_level(book, order_state.price, -fill_qty)
+            shadow_fill = self._shadow_fills_orders.get(order_id_int, 0.0)
+            if shadow_fill and shadow_fill != trade_qty:
+                self._log(
+                    f"Mismatch between simulated fill and trade fill for order {order_id_int}: "
+                    f"simulated={shadow_fill} trade={trade_qty}"
+                )
+            shadow_used = min(trade_qty, shadow_fill)
+            exec_qty = trade_qty - shadow_used
+            if shadow_fill:
+                new_shadow = shadow_fill - shadow_used
+                if new_shadow > 0:
+                    self._shadow_fills_orders[order_id_int] = new_shadow
+                else:
+                    self._shadow_fills_orders.pop(order_id_int, None)
+            order_state.qty -= exec_qty
+            if order_state.is_limit and order_state.price is not None and exec_qty > 0:
+                if order_state.side == 1:
+                    level_shadow = self._shadow_fills_bids.get(order_state.price, 0.0)
+                else:
+                    level_shadow = self._shadow_fills_asks.get(order_state.price, 0.0)
+                level_used = min(exec_qty, level_shadow)
+                remaining_trade = exec_qty - level_used
+                if level_shadow:
+                    new_level_shadow = level_shadow - level_used
+                    if order_state.side == 1:
+                        if new_level_shadow > 0:
+                            self._shadow_fills_bids[order_state.price] = new_level_shadow
+                        else:
+                            self._shadow_fills_bids.pop(order_state.price, None)
+                    else:
+                        if new_level_shadow > 0:
+                            self._shadow_fills_asks[order_state.price] = new_level_shadow
+                        else:
+                            self._shadow_fills_asks.pop(order_state.price, None)
+                if remaining_trade > 0:
+                    book = self._bids if order_state.side == 1 else self._asks
+                    self._update_level(book, order_state.price, -remaining_trade)
             if order_state.qty <= 0:
                 self._orders.pop(order_id_int, None)
         self._log(f"Trade qty={trade_qty} price={trade_price}")
