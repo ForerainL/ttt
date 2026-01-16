@@ -151,8 +151,29 @@ class OrderBookRector:
         }
         if "msg_seq_num" in row:
             snapshot["msg_seq_num"] = row.get("msg_seq_num")
-        asks = self._top_levels(self._asks, 10, reverse=False)
-        bids = self._top_levels(self._bids, 10, reverse=True)
+        # Snapshot-level simulated matching is a projection used only to
+        # enforce non-crossing views and does not represent real execution.
+        # Snapshot-only copies for simulated matching.
+        bids = list(sorted(self._bids.items(), reverse=True))
+        asks = list(sorted(self._asks.items()))
+        while bids and asks and bids[0][0] >= asks[0][0]:
+            bid_price, bid_qty = bids[0]
+            ask_price, ask_qty = asks[0]
+            match_qty = min(bid_qty, ask_qty)
+            bid_qty -= match_qty
+            ask_qty -= match_qty
+            if bid_qty <= 0:
+                bids.pop(0)
+            else:
+                bids[0] = (bid_price, bid_qty)
+            if ask_qty <= 0:
+                asks.pop(0)
+            else:
+                asks[0] = (ask_price, ask_qty)
+        bids.sort(key=lambda item: item[0], reverse=True)
+        asks.sort(key=lambda item: item[0])
+        bids = bids[:10]
+        asks = asks[:10]
         for idx in range(1, 11):
             ask_price, ask_qty = (asks[idx - 1] if idx <= len(asks) else (None, None))
             bid_price, bid_qty = (bids[idx - 1] if idx <= len(bids) else (None, None))
