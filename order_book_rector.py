@@ -59,6 +59,19 @@ class OrderBookRector:
         side = int(row["order_side"])
         qty = float(row["order_qty"])
         order_flag = str(row.get("msg_order_flag", ""))
+        if order_flag == "3":
+            best_bid = next(reversed(self._bids.keys()), None) if self._bids else None
+            best_ask = next(iter(self._asks.keys()), None) if self._asks else None
+            reference_price = best_bid if side == 1 else best_ask
+            if reference_price is None:
+                self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
+                self._log(f"Insert best-of-own order {order_id} side={side} qty={qty} (no reference)")
+                return
+            self._orders[order_id] = _OrderState(side=side, price=reference_price, qty=qty, is_limit=True)
+            book = self._bids if side == 1 else self._asks
+            self._update_level(book, reference_price, qty)
+            self._log(f"Insert best-of-own order {order_id} side={side} price={reference_price} qty={qty}")
+            return
         if order_flag == "2":
             price = float(row["order_opx"])
             self._orders[order_id] = _OrderState(side=side, price=price, qty=qty, is_limit=True)
@@ -86,41 +99,72 @@ class OrderBookRector:
         self._log(f"Cancel order {order_id} qty={cancel_qty}")
 
     def _apply_trade(self, row: pd.Series) -> None:
-        trade_qty = float(row["trade_tvl"])
-        trade_price = float(row["trade_tpx"])
+        def get_field(name: str) -> object:
+            if hasattr(row, "get"):
+                return row.get(name)
+            return getattr(row, name)
+
+        trade_qty = float(get_field("trade_tvl"))
+        trade_price = float(get_field("trade_tpx"))
         self._cum_trade_qty += trade_qty
         self._cum_trade_amt += trade_qty * trade_price
         self._last_price = trade_price
 
-        def apply_fill(order_id_raw: object, *, expected_side: int) -> None:
-            if pd.isna(order_id_raw):
-                return
-            try:
-                order_id_int = int(order_id_raw)
-            except (TypeError, ValueError):
-                return
+        bid_order_id = get_field("bid_order_id")
+        if bid_order_id is not None and not pd.isna(bid_order_id):
+            order_id_int = int(bid_order_id)
             order_state = self._orders.get(order_id_int)
             if not order_state:
                 self._log(
                     f"Trade references unknown order_id={order_id_int} "
-                    f"(side={expected_side}); cannot locate level"
+                    f"(side=1); cannot locate level"
                 )
-                return
-            if order_state.side != expected_side:
-                self._log(
-                    f"Warning: order_id={order_id_int} side mismatch: "
-                    f"state={order_state.side} expected={expected_side}"
-                )
-            fill_qty = min(trade_qty, order_state.qty)
-            order_state.qty -= fill_qty
-            if order_state.price is not None:
-                book = self._bids if order_state.side == 1 else self._asks
-                self._update_level(book, order_state.price, -fill_qty)
-            if order_state.qty <= 0:
-                self._orders.pop(order_id_int, None)
+            else:
+                if order_state.side != 1:
+                    self._log(
+                        f"Warning: order_id={order_id_int} side mismatch: "
+                        f"state={order_state.side} expected=1"
+                    )
+                fill_qty = min(trade_qty, order_state.qty)
+                order_state.qty -= fill_qty
+                if order_state.price is None and not order_state.is_limit:
+                    order_state.price = trade_price
+                    order_state.is_limit = True
+                    if order_state.qty > 0:
+                        self._update_level(self._bids, order_state.price, order_state.qty)
+                else:
+                    if order_state.price is not None:
+                        self._update_level(self._bids, order_state.price, -fill_qty)
+                if order_state.qty <= 0:
+                    self._orders.pop(order_id_int, None)
 
-        apply_fill(row.get("bid_order_id"), expected_side=1)
-        apply_fill(row.get("ask_order_id"), expected_side=2)
+        ask_order_id = get_field("ask_order_id")
+        if ask_order_id is not None and not pd.isna(ask_order_id):
+            order_id_int = int(ask_order_id)
+            order_state = self._orders.get(order_id_int)
+            if not order_state:
+                self._log(
+                    f"Trade references unknown order_id={order_id_int} "
+                    f"(side=2); cannot locate level"
+                )
+            else:
+                if order_state.side != 2:
+                    self._log(
+                        f"Warning: order_id={order_id_int} side mismatch: "
+                        f"state={order_state.side} expected=2"
+                    )
+                fill_qty = min(trade_qty, order_state.qty)
+                order_state.qty -= fill_qty
+                if order_state.price is None and not order_state.is_limit:
+                    order_state.price = trade_price
+                    order_state.is_limit = True
+                    if order_state.qty > 0:
+                        self._update_level(self._asks, order_state.price, order_state.qty)
+                else:
+                    if order_state.price is not None:
+                        self._update_level(self._asks, order_state.price, -fill_qty)
+                if order_state.qty <= 0:
+                    self._orders.pop(order_id_int, None)
         self._log(f"Trade qty={trade_qty} price={trade_price}")
 
     def _top_levels(self, book: SortedDict[float, float], depth: int, reverse: bool) -> List[Tuple[float, float]]:
@@ -134,46 +178,51 @@ class OrderBookRector:
         return levels
 
     def _build_snapshot(self, row: pd.Series) -> Dict[str, object]:
+        def get_field(name: str, default: object = None) -> object:
+            if hasattr(row, "get"):
+                return row.get(name, default)
+            return getattr(row, name, default)
+
         limit_side = None
-        if "limit_side" in row:
+        if hasattr(row, "get") and "limit_side" in row:
             limit_side = row.get("limit_side")
         elif self._limit_state_detector is not None:
             limit_side = self._limit_state_detector(row)
 
         snapshot: Dict[str, object] = {
-            "skey": row.get("skey"),
-            "hhmmss_nano": row.get("hhmmss_nano"),
-            "yyyymmdd": row.get("yyyymmdd"),
-            "obe_seq_num": row.get("obe_seq_num"),
+            "skey": get_field("skey"),
+            "hhmmss_nano": get_field("hhmmss_nano"),
+            "yyyymmdd": get_field("yyyymmdd"),
+            "obe_seq_num": get_field("obe_seq_num"),
             "cum_trade_tvl": self._cum_trade_qty,
             "cum_trade_amt": self._cum_trade_amt,
             "last": self._last_price,
         }
-        if "msg_seq_num" in row:
-            snapshot["msg_seq_num"] = row.get("msg_seq_num")
+        msg_seq_num = get_field("msg_seq_num")
+        if msg_seq_num is not None:
+            snapshot["msg_seq_num"] = msg_seq_num
         # Snapshot-level simulated matching is a projection used only to
         # enforce non-crossing views and does not represent real execution.
-        # Snapshot-only copies for simulated matching.
-        bids = list(sorted(self._bids.items(), reverse=True))
-        asks = list(sorted(self._asks.items()))
-        while bids and asks and bids[0][0] >= asks[0][0]:
-            bid_price, bid_qty = bids[0]
-            ask_price, ask_qty = asks[0]
-            match_qty = min(bid_qty, ask_qty)
-            bid_qty -= match_qty
-            ask_qty -= match_qty
-            if bid_qty <= 0:
-                bids.pop(0)
-            else:
-                bids[0] = (bid_price, bid_qty)
-            if ask_qty <= 0:
-                asks.pop(0)
-            else:
-                asks[0] = (ask_price, ask_qty)
+        depth = 10
+        buffer_depth = 10
+        bids = [list(item) for item in self._top_levels(self._bids, depth + buffer_depth, reverse=True)]
+        asks = [list(item) for item in self._top_levels(self._asks, depth + buffer_depth, reverse=False)]
+        bid_idx = 0
+        ask_idx = 0
+        while bid_idx < len(bids) and ask_idx < len(asks) and bids[bid_idx][0] >= asks[ask_idx][0]:
+            match_qty = min(bids[bid_idx][1], asks[ask_idx][1])
+            bids[bid_idx][1] -= match_qty
+            asks[ask_idx][1] -= match_qty
+            if bids[bid_idx][1] <= 0:
+                bid_idx += 1
+            if asks[ask_idx][1] <= 0:
+                ask_idx += 1
+        bids = bids[bid_idx:]
+        asks = asks[ask_idx:]
         bids.sort(key=lambda item: item[0], reverse=True)
         asks.sort(key=lambda item: item[0])
-        bids = bids[:10]
-        asks = asks[:10]
+        bids = [tuple(item) for item in bids[:depth]]
+        asks = [tuple(item) for item in asks[:depth]]
         for idx in range(1, 11):
             ask_price, ask_qty = (asks[idx - 1] if idx <= len(asks) else (None, None))
             bid_price, bid_qty = (bids[idx - 1] if idx <= len(bids) else (None, None))
@@ -207,24 +256,44 @@ class OrderBookRector:
         trade_events["_event_type"] = "trade"
         events = pd.concat([order_events, trade_events], ignore_index=True, sort=False)
 
+        for col in ["msg_order_type", "msg_order_flag", "order_side"]:
+            if col in events.columns:
+                events[col] = pd.to_numeric(events[col], errors="coerce").fillna(-1).astype(int)
+
         sort_keys = [key for key in ["yyyymmdd", "hhmmss_nano", "obe_seq_num", "msg_seq_num"] if key in events.columns]
         if sort_keys:
             events = events.sort_values(sort_keys, kind="mergesort")
 
         snapshots: List[Dict[str, object]] = []
-        for _, row in events.iterrows():
-            if row["_event_type"] == "order":
-                msg_type = str(row.get("msg_order_type", ""))
-                if msg_type == "1":
-                    self._apply_insert(row)
-                elif msg_type == "3":
-                    self._apply_cancel(row)
+        class _RowView:
+            __slots__ = ("_row",)
+
+            def __init__(self, row_obj: object) -> None:
+                self._row = row_obj
+
+            def __getitem__(self, key: str) -> object:
+                return getattr(self._row, key)
+
+            def get(self, key: str, default: object = None) -> object:
+                return getattr(self._row, key, default)
+
+            def __contains__(self, key: str) -> bool:
+                return hasattr(self._row, key)
+
+        for row in events.itertuples(index=False):
+            row_view = _RowView(row)
+            if row._event_type == "order":
+                msg_type = row.msg_order_type
+                if msg_type == 1:
+                    self._apply_insert(row_view)
+                elif msg_type == 3:
+                    self._apply_cancel(row_view)
                 else:
                     self._log(f"Unknown order type {msg_type}")
             else:
-                self._apply_trade(row)
-            if self._within_time_window(row):
-                snapshots.append(self._build_snapshot(row))
+                self._apply_trade(row_view)
+            if self._within_time_window(row_view):
+                snapshots.append(self._build_snapshot(row_view))
 
         return pd.DataFrame(snapshots)
 
