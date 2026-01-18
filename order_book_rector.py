@@ -59,6 +59,19 @@ class OrderBookRector:
         side = int(row["order_side"])
         qty = float(row["order_qty"])
         order_flag = str(row.get("msg_order_flag", ""))
+        if order_flag == "3":
+            best_bid = next(reversed(self._bids.keys()), None) if self._bids else None
+            best_ask = next(iter(self._asks.keys()), None) if self._asks else None
+            reference_price = best_bid if side == 1 else best_ask
+            if reference_price is None:
+                self._orders[order_id] = _OrderState(side=side, price=None, qty=qty, is_limit=False)
+                self._log(f"Insert best-of-own order {order_id} side={side} qty={qty} (no reference)")
+                return
+            self._orders[order_id] = _OrderState(side=side, price=reference_price, qty=qty, is_limit=True)
+            book = self._bids if side == 1 else self._asks
+            self._update_level(book, reference_price, qty)
+            self._log(f"Insert best-of-own order {order_id} side={side} price={reference_price} qty={qty}")
+            return
         if order_flag == "2":
             price = float(row["order_opx"])
             self._orders[order_id] = _OrderState(side=side, price=price, qty=qty, is_limit=True)
@@ -113,9 +126,16 @@ class OrderBookRector:
                 )
             fill_qty = min(trade_qty, order_state.qty)
             order_state.qty -= fill_qty
-            if order_state.price is not None:
-                book = self._bids if order_state.side == 1 else self._asks
-                self._update_level(book, order_state.price, -fill_qty)
+            if order_state.price is None and not order_state.is_limit:
+                order_state.price = trade_price
+                order_state.is_limit = True
+                if order_state.qty > 0:
+                    book = self._bids if order_state.side == 1 else self._asks
+                    self._update_level(book, order_state.price, order_state.qty)
+            else:
+                if order_state.price is not None:
+                    book = self._bids if order_state.side == 1 else self._asks
+                    self._update_level(book, order_state.price, -fill_qty)
             if order_state.qty <= 0:
                 self._orders.pop(order_id_int, None)
 
